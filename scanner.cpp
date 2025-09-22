@@ -10,6 +10,7 @@
 #include <sys/time.h>
 
 
+// ========== Port Validation Helpers ==========
 void check_if_digit(std::string str) {
     for (char c : str) {
         if (!std::isdigit(static_cast<unsigned char>(c))) {
