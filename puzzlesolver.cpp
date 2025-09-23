@@ -484,9 +484,9 @@ int main(int argc, char *argv[]) {
 
     // 1) SECRET (required for signature)
     if (port_of[SECRET] != -1) {
-        std::cout << "========================== S.E.C.R.E.T PORT ON " << port << " ==========================\n";
-        if (!handle_secret(ip_string, port, groupID, signature, secret_port1)) {
-            std::cerr << "S.E.C.R.E.T. flow failed on port " << port << "\n";
+        std::cout << "========================== S.E.C.R.E.T PORT ON " << port_of[SECRET] << " ==========================\n";
+        if (!handle_secret(ip_string, port_of[SECRET], groupID, signature, secret_port1)) {
+            std::cerr << "S.E.C.R.E.T. flow failed\n";
         } else {
             std::cout << "GroupID = " << groupID
                         << " Signature = " << signature
@@ -499,11 +499,11 @@ int main(int argc, char *argv[]) {
 
     // 2) EVIL
     if (port_of[EVIL] != -1) {
-        std::cout << "========================== E.V.I.L PORT ON " << port << " ==========================\n";
-        if (!handle_evil(ip_string, port, signature, static_cast<uint8_t>(groupID))) {
-            std::cerr << "E.V.I.L. flow failed on port " << port << "\n";
+        std::cout << "========================== E.V.I.L PORT ON " << port_of[EVIL] << " ==========================\n";
+        if (!handle_evil(ip_string, port_of[EVIL], signature, static_cast<uint8_t>(groupID))) {
+            std::cerr << "E.V.I.L. flow failed\n";
         } else {
-            std::cout << "[EVIL] signature sent to port " << port << "\n";
+            std::cout << "[EVIL] signature sent to port " << port_of[EVIL] << "\n";
         }
     } else {
         std::cout << "[info] No E.V.I.L. port found.\n";
@@ -511,16 +511,17 @@ int main(int argc, char *argv[]) {
 
     // 3) CHECKSUM
     if (port_of[CHECKSUM] != -1) {
-        std::cout << "========================== C.H.E.C.K.S.U.M PORT ON " << port << " ==========================\n";
+        std::cout << "========================== C.H.E.C.K.S.U.M PORT ON " << port_of[CHECKSUM] << " ==========================\n";
         if (!handle_checksum(ip_string, port_of[CHECKSUM], signature)) {
             std::cerr << "CHECKSUM failed\n";
+        }
     } else {
         std::cout << "[info] No CHECKSUM port found.\n";
     }
 
     // 4) EXPSTN
     if (port_of[EXPSTN] != -1) {
-        std::cout << "========================== E.X.P.S.T.N PORT ON " << port << " ==========================\n";
+        std::cout << "========================== E.X.P.S.T.N PORT ON " << port_of[EXPSTN] << " ==========================\n";
         if (!handle_exps(ip_string, port_of[EXPSTN], signature, secret_ports)) {
             std::cerr << "E.X.P.S.T.N. failed\n";
         } 
