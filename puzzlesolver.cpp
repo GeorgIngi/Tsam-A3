@@ -212,12 +212,42 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
         if (m > 0) {
             buf[m] = '\0';
             std::cout << "[secret port] raw reply (ASCII if printable): '" << buf << "'\n";
-            secret_port1 = std::atoi(buf);
-            if (secret_port1 > 0) {
-                got_secret_port = true;
-                break;
+            std::string reply_str(buf, m); // capture reply as string
+            std::smatch sm;
+            bool parsed_ok = false;
+            long parsed_val = 0;
+
+            try {
+                // 1) targeted regex: look for "port[: -]*<digits>"
+                std::regex port_re(R"(port[:\s-]*([0-9]{1,5}))", std::regex_constants::icase);
+                if (std::regex_search(reply_str, sm, port_re) && sm.size() >= 2) {
+                    parsed_val = std::stol(sm[1].str());
+                    parsed_ok = true;
+                } else {
+                    // 2) fallback: find all digit runs and take the last one
+                    std::regex all_digits(R"((\d{1,5}))");
+                    std::sregex_iterator it(reply_str.begin(), reply_str.end(), all_digits);
+                    std::sregex_iterator end;
+                    for (; it != end; ++it) {
+                        parsed_val = std::stol((*it)[1].str()); // last match wins
+                        parsed_ok = true;
+                    }
+                }
+            } catch (const std::exception &e) {
+                std::cerr << "[WARN] exception parsing port from reply: " << e.what() << "\n";
+                parsed_ok = false;
+            }
+
+            if (parsed_ok) {
+                if (parsed_val >= 1 && parsed_val <= 65535) {
+                    secret_port1 = static_cast<int>(parsed_val);
+                    got_secret_port = true;
+                    break;
+                } else {
+                    std::cerr << "[WARN] parsed port out of range: " << parsed_val << "\n";
+                }
             } else {
-                std::cerr << "[WARN] atoi parsed port as " << secret_port1 << " -- maybe reply is binary. Check hex dump above.\n";
+                std::cerr << "[WARN] no numeric substring found in reply\n";
             }
         }
     }
@@ -241,11 +271,94 @@ bool handle_checksum(const char* ip, int port, uint32_t signature) {
     std::cout << "[STUB] handle_checksum on port " << port << " with signature=" << signature << "\n";
     return true;
 }
-bool handle_evil(const char* ip, int port, uint32_t signature) {
-    // raw socket + EVIL bit flow
-    std::cout << "[STUB] handle_evil on port " << port << " with signature=" << signature << "\n";
-    return true;
+
+bool handle_evil(const char* ip, int port, uint32_t signature, uint8_t groupID) {
+    // create a fresh socket for the E.V.I.L flow
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) {
+        perror("evil socket");
+        return false;
+    }
+
+    // Bind to port so replies come back to us (optional)
+    // sockaddr_in bind_addr;
+    // std::memset(&bind_addr, 0, sizeof(bind_addr));
+    // bind_addr.sin_family = AF_INET;
+    // bind_addr.sin_addr.s_addr = INADDR_ANY;
+    // bind_addr.sin_port = 0; // ephemeral
+    // if (bind(s, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+    //     perror("evil bind");
+    //     close(s);
+    //     return false;
+    // }
+
+    // Set a timeout for receiving responses
+    timeval tv;
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt");
+        close(s);
+        return false;
+    }
+
+    // Destination address
+    struct sockaddr_in dst;
+    std::memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &dst.sin_addr) != 1) {
+        std::cerr << "bad ip address for evil: " << ip << "\n";
+        close(s);
+        return false;
+    }
+
+    // Trying 2 byte orders: network order first, fallback to host order.
+    uint32_t orders[2] = { htonl(signature), signature };
+    bool sent_ok = false;
+    bool got_reply = false;
+    char rbuf[1024];
+    sockaddr_in from; socklen_t fl = sizeof(from);
+
+    for (int attempt = 0; attempt < 2 && !got_reply; ++attempt) {
+        uint32_t out = orders[attempt];
+        ssize_t n = sendto(s, &out, sizeof(out), 0, (const sockaddr*)&dst, sizeof(dst));
+        if (n != (ssize_t)sizeof(out)) {
+            perror("sendto evil signature");
+        } else {
+            sent_ok = true;
+            std::cout << "[EVIL] Sent 4-byte signature (order " << (attempt==0 ? "network" : "host") << ")\n";
+            // wait for reply
+            ssize_t r = recvfrom(s, rbuf, sizeof(rbuf)-1, 0, (sockaddr*)&from, &fl);
+            if (r < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    std::cerr << "[EVIL] no reply (timeout) for this byte order, trying next\n";
+                    continue;
+                } else {
+                    perror("recvfrom evil");
+                    break;
+                }
+            } else {
+                // got a reply
+                rbuf[r] = '\0';
+                char frombuf[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &from.sin_addr, frombuf, sizeof(frombuf));
+                std::cout << "[EVIL] reply from " << frombuf << ":" << ntohs(from.sin_port)
+                          << " (" << r << " bytes): '" << rbuf << "'\n";
+                got_reply = true;
+                break;
+            }
+        }
+    }
+
+    if (!sent_ok) {
+        std::cerr << "[EVIL] failed to send signature\n";
+    }
+
+    close(s);
+    return got_reply || sent_ok;
 }
+
 bool handle_exps(const char* ip, int port, uint32_t signature, const std::vector<int>& secret_ports) {
     // send secret ports list + knocks, format: [4 bytes signature][phrase]
     std::cout << "[STUB] handle_exps on port " << port << " (signature=" << signature << ")\n";
@@ -364,53 +477,55 @@ int main(int argc, char *argv[]) {
     close(sock);
 
     // ---- RUN HANDLERS ONCE, IN ORDER ----
-    uint32_t groupID = 0;
-    uint32_t signature = 0;
-    std::vector<int> secret_ports; // you may collect more later if needed
-    int secret_port1 = 0;
+    static uint32_t groupID = 0;
+    static uint32_t signature = 0;
+    std::vector<int> secret_ports;
+    static int secret_port1 = 0;
 
     // 1) SECRET (required for signature)
     if (port_of[SECRET] != -1) {
-        std::cout << "========================== S.E.C.R.E.T on " << port_of[SECRET] << " ==========================\n";
-        if (!handle_secret(ip_string, port_of[SECRET], groupID, signature, secret_port1)) {
-            std::cerr << "S.E.C.R.E.T. failed\n";
+        std::cout << "========================== S.E.C.R.E.T PORT ON " << port << " ==========================\n";
+        if (!handle_secret(ip_string, port, groupID, signature, secret_port1)) {
+            std::cerr << "S.E.C.R.E.T. flow failed on port " << port << "\n";
         } else {
-            std::cout << "GroupID = " << groupID << " Signature = " << signature 
-                      << " SecretPort1 = " << secret_port1 << "\n";
+            std::cout << "GroupID = " << groupID
+                        << " Signature = " << signature
+                        << " SecretPort1 = " << secret_port1 << "\n";
             if (secret_port1 > 0) secret_ports.push_back(secret_port1);
         }
     } else {
-        std::cerr << "[error] No SECRET port discovered. Skipping the rest will likely fail.\n";
+        std::cerr << "[error] No S.E.C.R.E.T. port discovered. Skipping the rest will likely fail.\n";
     }
-    
+
     // 2) EVIL
     if (port_of[EVIL] != -1) {
-        std::cout << "========================== EVIL on " << port_of[EVIL] << " ==========================\n";
-        if (!handle_evil(ip_string, port_of[EVIL], signature)) {
-            std::cerr << "EVIL failed\n";
+        std::cout << "========================== E.V.I.L PORT ON " << port << " ==========================\n";
+        if (!handle_evil(ip_string, port, signature, static_cast<uint8_t>(groupID))) {
+            std::cerr << "E.V.I.L. flow failed on port " << port << "\n";
+        } else {
+            std::cout << "[EVIL] signature sent to port " << port << "\n";
         }
     } else {
-        std::cout << "[info] No EVIL port found.\n";
+        std::cout << "[info] No E.V.I.L. port found.\n";
     }
 
     // 3) CHECKSUM
     if (port_of[CHECKSUM] != -1) {
-        std::cout << "========================== CHECKSUM on " << port_of[CHECKSUM] << " ==========================\n";
+        std::cout << "========================== C.H.E.C.K.S.U.M PORT ON " << port << " ==========================\n";
         if (!handle_checksum(ip_string, port_of[CHECKSUM], signature)) {
             std::cerr << "CHECKSUM failed\n";
-        }
     } else {
         std::cout << "[info] No CHECKSUM port found.\n";
     }
 
     // 4) EXPSTN
     if (port_of[EXPSTN] != -1) {
-        std::cout << "========================== E.X.P.S.T.N on " << port_of[EXPSTN] << " ==========================\n";
+        std::cout << "========================== E.X.P.S.T.N PORT ON " << port << " ==========================\n";
         if (!handle_exps(ip_string, port_of[EXPSTN], signature, secret_ports)) {
-            std::cerr << "E.X.P.S.T.N failed\n";
-        }
+            std::cerr << "E.X.P.S.T.N. failed\n";
+        } 
     } else {
-        std::cout << "[info] No E.X.P.S.T.N port found.\n";
+        std::cout << "[info] No E.X.P.S.T.N. port found.\n";
     }
 
     return 0;
