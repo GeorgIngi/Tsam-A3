@@ -16,8 +16,13 @@
 #include <cctype>
 #include <cstdlib>
 
-// ========== Constants ==========
+// ========== Global variables ==========
 const std::string usernames = "georg23,arnagud21";
+const int SECRET = 0;
+const int EVIL = 1;
+const int CHECKSUM = 2;
+const int EXPSTN = 3;
+
 
 // ========== Port Validation Helpers ==========
 void check_if_digit(const std::string &str) {
@@ -36,44 +41,20 @@ void check_in_range(int val) {
     }
 }
 
-// ========== UDP helpers ==========
-static bool send_all_udp(int sock, const sockaddr_in &dst, const void *data, size_t len) {
-    ssize_t n = sendto(sock, data, len, 0, (const sockaddr*)&dst, sizeof(dst));
-    return n == (ssize_t)len;
-}
-
-static std::string recv_text(int sock, int ms_timeout) {
-    timeval tv{ ms_timeout/1000, static_cast<suseconds_t>((ms_timeout%1000)*1000) };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    char buf[2048];
-    sockaddr_in from{};
-    socklen_t fl = sizeof(from);
-
-    ssize_t n = recvfrom(sock, buf, sizeof(buf) - 1, 0,
-                         (struct sockaddr*)&from, &fl);
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return {}; // timeout
-        perror("recvfrom");
-        return {};
-    }
-    buf[n] = 0;
-    return std::string(buf);
-}
 
 // ========== Port Classification ==========
-bool is_secret(const std::string& s){
-    return s.find("Greetings from S.E.C.R.E.T.") != std::string::npos;
-}
-bool is_evil(const std::string& s){
-    return s.find("I am an evil port") != std::string::npos;
-}
-bool is_checksum(const std::string& s){
-    // BUG FIX: must compare to npos
-    return s.find("Send me a 4-byte message containing the signature") != std::string::npos;
-}
-bool is_exps(const std::string& s){
-    return s.find("E.X.P.S.T.N") != std::string::npos;
+int check_port_type(const std::string &s) {
+    if (s.find("Greetings from S.E.C.R.E.T.") != std::string::npos) {
+        return SECRET;
+    } else if (s.find("Send me a 4-byte message containing the signature") != std::string::npos) {
+        return CHECKSUM;
+    } else if (s.find("I am an evil port") != std::string::npos) {
+        return EVIL;
+    } else if (s.find("E.X.P.S.T.N") != std::string::npos) {
+        return EXPSTN;
+    } else {
+        return -1;
+    }
 }
 
 // ========== Secret Port Helper ==========
@@ -86,12 +67,12 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
         return false;
     }
 
-    // bind to ephemeral port so replies go to our socket
+    // bind to port so replies go to our socket
     sockaddr_in bind_addr;
     std::memset(&bind_addr, 0, sizeof(bind_addr));
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_addr.s_addr = INADDR_ANY;
-    bind_addr.sin_port = 0; // ephemeral
+    bind_addr.sin_port = 0;
     if (bind(s, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
         perror("bind");
         close(s);
@@ -99,17 +80,17 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
     }
 
     // show local binding
-    sockaddr_in local;
-    socklen_t local_len = sizeof(local);
-    if (getsockname(s, (struct sockaddr*)&local, &local_len) == 0) {
-        char addrbuf[INET_ADDRSTRLEN] = {0};
-        inet_ntop(AF_INET, &local.sin_addr, addrbuf, sizeof(addrbuf));
-        std::cout << "[DEBUG] SECRET socket bound locally to " << addrbuf << ":" << ntohs(local.sin_port) << "\n";
-    }
+    // sockaddr_in local;
+    // socklen_t local_len = sizeof(local);
+    // if (getsockname(s, (struct sockaddr*)&local, &local_len) == 0) {
+    //     char addrbuf[INET_ADDRSTRLEN] = {0};
+    //     inet_ntop(AF_INET, &local.sin_addr, addrbuf, sizeof(addrbuf));
+    //     std::cout << "[DEBUG] SECRET socket bound locally to " << addrbuf << ":" << ntohs(local.sin_port) << "\n";
+    // }
 
     // set a longer timeout for reliability
     timeval tv;
-    tv.tv_sec = 3;
+    tv.tv_sec = 5;
     tv.tv_usec = 0;
     if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
         perror("setsockopt");
@@ -254,6 +235,23 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
     return true;
 }
 
+bool handle_checksum(const char* ip, int port, uint32_t signature) {
+    // send 4-byte signature (network order), parse reply as needed
+    // return true/false
+    std::cout << "[STUB] handle_checksum on port " << port << " with signature=" << signature << "\n";
+    return true;
+}
+bool handle_evil(const char* ip, int port, uint32_t signature) {
+    // raw socket + EVIL bit flow
+    std::cout << "[STUB] handle_evil on port " << port << " with signature=" << signature << "\n";
+    return true;
+}
+bool handle_exps(const char* ip, int port, uint32_t signature, const std::vector<int>& secret_ports) {
+    // send secret ports list + knocks, format: [4 bytes signature][phrase]
+    std::cout << "[STUB] handle_exps on port " << port << " (signature=" << signature << ")\n";
+    return true;
+}
+
 
 int main(int argc, char *argv[]) {
     int port1 = 0;
@@ -309,88 +307,111 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    std::vector<int> ports = {port1, port2, port3, port4};
-    std::vector<int> secret_ports;
-    std::string secret_phrase;
-    int final_port = 0;
-    bool raw_socket_used = false;
+    std::vector<int> input_ports = {port1, port2, port3, port4};
 
-    std::string default_message = "tester";
+    // Map: type -> actual port. Initialize to -1 (unknown)
+    int port_of[4] = {-1, -1, -1, -1};
 
-    for (int port : ports) {
-        struct sockaddr_in dst;
-        std::memset(&dst, 0, sizeof(dst));
-        dst.sin_family = AF_INET;
-        dst.sin_port   = htons(port);
+    // ---- SCAN & CLASSIFY ONLY (no handlers here) ----
+    for (int port : input_ports) {
+        sockaddr_in dst{}; 
+        dst.sin_family = AF_INET; 
+        dst.sin_port = htons(port);
         if (inet_pton(AF_INET, ip_string, &dst.sin_addr) != 1) {
             std::cerr << "bad ip address: " << ip_string << "\n";
             continue;
         }
 
-        // --- send a ≥6 byte probe ---
-        const char* probe = "tester"; // exactly 6 bytes
+        // send a small probe (≥6 bytes)
+        const char* probe = "tester";
         ssize_t sent = sendto(sock, probe, std::strlen(probe), 0,
-                              (const struct sockaddr*)&dst, sizeof(dst));
-        if (sent < 0) {
-            perror("sendto");
-            continue;
-        }
+                              (sockaddr*)&dst, sizeof(dst));
+        if (sent < 0) { perror("sendto"); continue; }
 
-        // --- receive banner (1s timeout already set on socket) ---
+        // read banner
         char buf[2048];
-        struct sockaddr_in from;
-        socklen_t fromlen = sizeof(from);
-        ssize_t n = recvfrom(sock, buf, sizeof(buf)-1, 0,
-                             (struct sockaddr*)&from, &fromlen);
-
+        sockaddr_in from{}; socklen_t fl = sizeof(from);
+        ssize_t n = recvfrom(sock, buf, sizeof(buf)-1, 0, (sockaddr*)&from, &fl);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
                 std::cout << "[port " << port << "] timeout waiting for banner\n";
-            } else {
+            else
                 perror("recvfrom");
-            }
             continue;
         }
-
         buf[n] = '\0';
         std::string banner(buf);
-
         std::cout << "[port " << port << "] banner: " << banner << "\n";
 
-        static uint32_t groupID = 0;
-        static uint32_t signature = 0;
-        static int secret_port1 = 0;
-
-        if (is_secret(banner)) {
-            std::cout << "========================== S.E.C.R.E.T PORT ON " << port << " ==========================\n";
-            if (!handle_secret(ip_string, port, groupID, signature, secret_port1)) {
-                std::cerr << "S.E.C.R.E.T. flow failed on port " << port << "\n";
-            } else {
-                std::cout << "GroupID = " << groupID
-                          << " Signature = " << signature
-                          << " SecretPort1 = " << secret_port1 << "\n";
-                secret_ports.push_back(secret_port1);
-            }
-            continue;
-
-        } else if (is_evil(banner)) {
-            std::cout << "========================== E.V.I.L PORT ON " << port << " ==========================\n";
-            // TODO: implement evil port handling (requires raw socket + root)
-            continue;
-
-        } else if (is_checksum(banner)) {
-            std::cout << "========================== C.H.E.C.K.S.U.M PORT ON " << port << " ==========================\n";
-            // TODO: implement checksum port handling
-            continue;
-        } else if (is_exps(banner)) {
-            std::cout << "========================== E.X.P.S.T.N PORT ON " << port << " ==========================\n";
-            // TODO: implement exps port handling
-            continue;
-        } else {
-            std::cout << "[port " << port << "] unknown service\n";
+        int t = check_port_type(banner);
+        if (t == -1) {
+            std::cout << "Classified: UNKNOWN\n";
             continue;
         }
+
+        if (port_of[t] == -1) {
+            port_of[t] = port;
+        } else if (port_of[t] != port) {
+            std::cout << "[warn] Duplicate " 
+                      << (t==SECRET?"SECRET":t==CHECKSUM?"CHECKSUM":t==EVIL?"EVIL":"EXPSTN")
+                      << " found on " << port << " (already recorded " << port_of[t] << ")\n";
+        }
+
+        std::cout << "Classified: "
+                  << (t==SECRET?"SECRET":t==CHECKSUM?"CHECKSUM":t==EVIL?"EVIL":"EXPSTN")
+                  << " on port " << port << "\n";
     }
     close(sock);
+
+    // ---- RUN HANDLERS ONCE, IN ORDER ----
+    uint32_t groupID = 0;
+    uint32_t signature = 0;
+    std::vector<int> secret_ports; // you may collect more later if needed
+    int secret_port1 = 0;
+
+    // 1) SECRET (required for signature)
+    if (port_of[SECRET] != -1) {
+        std::cout << "========================== S.E.C.R.E.T on " << port_of[SECRET] << " ==========================\n";
+        if (!handle_secret(ip_string, port_of[SECRET], groupID, signature, secret_port1)) {
+            std::cerr << "S.E.C.R.E.T. failed\n";
+        } else {
+            std::cout << "GroupID = " << groupID << " Signature = " << signature 
+                      << " SecretPort1 = " << secret_port1 << "\n";
+            if (secret_port1 > 0) secret_ports.push_back(secret_port1);
+        }
+    } else {
+        std::cerr << "[error] No SECRET port discovered. Skipping the rest will likely fail.\n";
+    }
+    
+    // 2) EVIL
+    if (port_of[EVIL] != -1) {
+        std::cout << "========================== EVIL on " << port_of[EVIL] << " ==========================\n";
+        if (!handle_evil(ip_string, port_of[EVIL], signature)) {
+            std::cerr << "EVIL failed\n";
+        }
+    } else {
+        std::cout << "[info] No EVIL port found.\n";
+    }
+
+    // 3) CHECKSUM
+    if (port_of[CHECKSUM] != -1) {
+        std::cout << "========================== CHECKSUM on " << port_of[CHECKSUM] << " ==========================\n";
+        if (!handle_checksum(ip_string, port_of[CHECKSUM], signature)) {
+            std::cerr << "CHECKSUM failed\n";
+        }
+    } else {
+        std::cout << "[info] No CHECKSUM port found.\n";
+    }
+
+    // 4) EXPSTN
+    if (port_of[EXPSTN] != -1) {
+        std::cout << "========================== E.X.P.S.T.N on " << port_of[EXPSTN] << " ==========================\n";
+        if (!handle_exps(ip_string, port_of[EXPSTN], signature, secret_ports)) {
+            std::cerr << "E.X.P.S.T.N failed\n";
+        }
+    } else {
+        std::cout << "[info] No E.X.P.S.T.N port found.\n";
+    }
+
     return 0;
 }
