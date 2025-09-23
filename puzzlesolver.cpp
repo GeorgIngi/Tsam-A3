@@ -12,6 +12,7 @@
 #include <regex>
 #include <netinet/udp.h>
 #include <netinet/ip.h>
+#include <netinet/in.h>
 #include <random>
 #include <cctype>
 #include <cstdlib>
@@ -22,7 +23,6 @@ const int SECRET = 0;
 const int EVIL = 1;
 const int CHECKSUM = 2;
 const int EXPSTN = 3;
-
 
 // ========== Port Validation Helpers ==========
 void check_if_digit(const std::string &str) {
@@ -40,7 +40,6 @@ void check_in_range(int val) {
         exit(1);
     }
 }
-
 
 // ========== Port Classification ==========
 int check_port_type(const std::string &s) {
@@ -61,8 +60,8 @@ int check_port_type(const std::string &s) {
 bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &out_signature, int &secret_port1) {
 
     // create a fresh socket for the S.E.C.R.E.T flow
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
         perror("socket");
         return false;
     }
@@ -73,28 +72,18 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_addr.s_addr = INADDR_ANY;
     bind_addr.sin_port = 0;
-    if (bind(s, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+    if (bind(sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
         perror("bind");
-        close(s);
+        close(sock);
         return false;
     }
 
-    // show local binding
-    // sockaddr_in local;
-    // socklen_t local_len = sizeof(local);
-    // if (getsockname(s, (struct sockaddr*)&local, &local_len) == 0) {
-    //     char addrbuf[INET_ADDRSTRLEN] = {0};
-    //     inet_ntop(AF_INET, &local.sin_addr, addrbuf, sizeof(addrbuf));
-    //     std::cout << "[DEBUG] SECRET socket bound locally to " << addrbuf << ":" << ntohs(local.sin_port) << "\n";
-    // }
-
-    // set a longer timeout for reliability
     timeval tv;
     tv.tv_sec = 5;
     tv.tv_usec = 0;
-    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
         perror("setsockopt");
-        close(s);
+        close(sock);
         return false;
     }
 
@@ -105,13 +94,16 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
     dst.sin_port = htons(port);
     if (inet_pton(AF_INET, ip, &dst.sin_addr) != 1) {
         std::cerr << "bad ip address: " << ip << "\n";
-        close(s);
+        close(sock);
         return false;
     }
 
     // 1) Generate secret number
     std::random_device rd;
-    uint32_t secret_number = rd();
+    // uint32_t secret_number = rd();
+
+    // For debugging, use a fixed secret number
+    uint32_t secret_number = 0x12345678; // or any fixed value
 
     // 2) send 'S' message: 'S' + 4 bytes (net-order secret) + usernames
     std::string msg;
@@ -120,37 +112,17 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
     msg.append(reinterpret_cast<char*>(&net_secret), 4);
     msg += usernames;
 
-    ssize_t sent = sendto(s, msg.data(), msg.size(), 0, (const sockaddr*)&dst, sizeof(dst));
+    ssize_t sent = sendto(sock, msg.data(), msg.size(), 0, (const sockaddr*)&dst, sizeof(dst));
     if (sent < 0) {
         perror("SECRET initial sendto");
-        close(s);
+        close(sock);
         return false;
     }
     std::cout << "Sent S message (" << sent << " bytes). Usernames: \"" << usernames << "\"\n";
     std::cout << "[DEBUG] S message bytes:";
     for (size_t i=0;i<msg.size();++i) printf(" %02x", (unsigned char)msg[i]);
     printf("\n");
-
-    // helper recv lambda
-    auto recv_and_report = [&](char *buf, size_t bufsz, ssize_t &out_len, sockaddr_in &from) -> bool {
-        socklen_t fl = sizeof(from);
-        out_len = recvfrom(s, buf, bufsz, 0, (sockaddr*)&from, &fl);
-        if (out_len < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                std::cerr << "[DEBUG] recvfrom: timeout (errno " << errno << ")\n";
-            } else {
-                perror("recvfrom");
-            }
-            return false;
-        }
-        char frombuf[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &from.sin_addr, frombuf, sizeof(frombuf));
-        std::cout << "[DEBUG] recvfrom: got " << out_len << " bytes from " << frombuf << ":" << ntohs(from.sin_port) << "\n";
-        std::cout << "[DEBUG] data:";
-        for (ssize_t i=0;i<out_len;++i) printf(" %02x", (unsigned char)buf[i]);
-        printf("\n");
-        return true;
-    };
+    
 
     // 3) wait for 5-byte challenge (up to a few attempts)
     char buf[1024];
@@ -158,9 +130,16 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
     ssize_t n = -1;
     bool got_challenge = false;
     for (int attempt=0; attempt<3 && !got_challenge; ++attempt) {
-        if (!recv_and_report(buf, sizeof(buf), n, from)) {
-            std::cerr << "[DEBUG] attempt " << attempt+1 << " to receive 5-byte challenge failed\n";
-            continue;
+        socklen_t fl = sizeof(from);
+        n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::cerr << "[DEBUG] attempt " << attempt+1 << " to receive 5-byte challenge timed out\n";
+            } else {
+                perror("recvfrom challenge");
+                close(sock);
+                return false;
+            }
         }
         if (n == 5) {
             got_challenge = true;
@@ -172,7 +151,7 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
 
     if (!got_challenge) {
         std::cerr << "SECRET failed: did not receive 5-byte challenge from S.E.C.R.E.T.\n";
-        close(s);
+        close(sock);
         return false;
     }
 
@@ -190,10 +169,10 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
     char reply[5];
     reply[0] = groupID;
     std::memcpy(reply+1, &net_sig, 4);
-    sent = sendto(s, reply, sizeof(reply), 0, (const sockaddr*)&dst, sizeof(dst));
+    sent = sendto(sock, reply, sizeof(reply), 0, (const sockaddr*)&dst, sizeof(dst));
     if (sent != (ssize_t)sizeof(reply)) {
         perror("SECRET send reply fail");
-        close(s);
+        close(sock);
         return false;
     }
     std::cout << "[INFO] Sent signature reply (5 bytes). signature=" << signature << "\n";
@@ -205,14 +184,19 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
     bool got_secret_port = false;
     ssize_t m = -1;
     for (int attempt=0; attempt<4 && !got_secret_port; ++attempt) {
-        if (!recv_and_report(buf, sizeof(buf)-1, m, from)) {
-            std::cerr << "[DEBUG] attempt " << attempt+1 << " waiting for secret-port reply failed\n";
+        socklen_t fl = sizeof(from);
+        m = recvfrom(sock, buf, sizeof(buf)-1, 0, (sockaddr*)&from, &fl);
+        if (m < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::cerr << "[DEBUG] attempt " << attempt+1 << " waiting for secret-port reply timed out\n";
+            } else {
+                perror("recv from secret port");
+            }
             continue;
         }
         if (m > 0) {
             buf[m] = '\0';
-            std::cout << "[secret port] raw reply (ASCII if printable): '" << buf << "'\n";
-            std::string reply_str(buf, m); // capture reply as string
+            std::string reply_str(buf, m);
             std::smatch sm;
             bool parsed_ok = false;
             long parsed_val = 0;
@@ -254,14 +238,110 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
 
     if (!got_secret_port) {
         std::cerr << "SECRET recv timeout waiting for secret port (or couldn't parse it)\n";
-        close(s);
+        close(sock);
         return false;
     }
 
     out_groupID = groupID;
     out_signature = signature;
     std::cout << "[SUCCESS] secret_port1 = " << secret_port1 << "\n";
-    close(s);
+    close(sock);
+    return true;
+}
+
+bool handle_evil(const char* ip, int port, uint32_t signature, uint8_t groupID) {
+    // create a fresh socket for the E.V.I.L flow
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        return false;
+    }
+
+    // also create raw socket to send from
+    int raw_sock = socket(AF_INET, SOCK_RAW, 0);
+    if (raw_sock < 0) {
+        perror("raw socket");
+        close(sock);
+        return false;
+    }
+
+    // bind to port so replies go to our socket
+    sockaddr_in bind_addr;
+    std::memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+    bind_addr.sin_port = 0;
+    if (bind(sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+        perror("bind");
+        close(sock);
+        return false;
+    }
+
+    timeval tv;
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt");
+        close(sock);
+        return false;
+    }
+
+    // Destination
+    struct sockaddr_in dst;
+    std::memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &dst.sin_addr) != 1) {
+        std::cerr << "bad ip address: " << ip << "\n";
+        close(sock);
+        return false;
+    }
+
+
+    // Trying 2 byte orders: network order first, fallback to host order.
+    // uint32_t orders[2] = { htonl(signature), signature };
+    // bool sent_ok = false;
+    // bool got_reply = false;
+    // char rbuf[1024];
+    // sockaddr_in from; socklen_t fl = sizeof(from);
+
+    // for (int attempt = 0; attempt < 2 && !got_reply; ++attempt) {
+    //     uint32_t out = orders[attempt];
+    //     ssize_t n = sendto(s, &out, sizeof(out), 0, (const sockaddr*)&dst, sizeof(dst));
+    //     if (n != (ssize_t)sizeof(out)) {
+    //         perror("sendto evil signature");
+    //     } else {
+    //         sent_ok = true;
+    //         std::cout << "[EVIL] Sent 4-byte signature (order " << (attempt==0 ? "network" : "host") << ")\n";
+    //         // wait for reply
+    //         ssize_t r = recvfrom(s, rbuf, sizeof(rbuf)-1, 0, (sockaddr*)&from, &fl);
+    //         if (r < 0) {
+    //             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    //                 std::cerr << "[EVIL] no reply (timeout) for this byte order, trying next\n";
+    //                 continue;
+    //             } else {
+    //                 perror("recvfrom evil");
+    //                 break;
+    //             }
+    //         } else {
+    //             // got a reply
+    //             rbuf[r] = '\0';
+    //             char frombuf[INET_ADDRSTRLEN];
+    //             inet_ntop(AF_INET, &from.sin_addr, frombuf, sizeof(frombuf));
+    //             std::cout << "[EVIL] reply from " << frombuf << ":" << ntohs(from.sin_port)
+    //                       << " (" << r << " bytes): '" << rbuf << "'\n";
+    //             got_reply = true;
+    //             break;
+    //         }
+    //     }
+    // }
+
+    // if (!sent_ok) {
+    //     std::cerr << "[EVIL] failed to send signature\n";
+    // }
+
+    close(sock);
+    close(raw_sock);
     return true;
 }
 
@@ -272,99 +352,11 @@ bool handle_checksum(const char* ip, int port, uint32_t signature) {
     return true;
 }
 
-bool handle_evil(const char* ip, int port, uint32_t signature, uint8_t groupID) {
-    // create a fresh socket for the E.V.I.L flow
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) {
-        perror("evil socket");
-        return false;
-    }
-
-    // Bind to port so replies come back to us (optional)
-    // sockaddr_in bind_addr;
-    // std::memset(&bind_addr, 0, sizeof(bind_addr));
-    // bind_addr.sin_family = AF_INET;
-    // bind_addr.sin_addr.s_addr = INADDR_ANY;
-    // bind_addr.sin_port = 0; // ephemeral
-    // if (bind(s, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
-    //     perror("evil bind");
-    //     close(s);
-    //     return false;
-    // }
-
-    // Set a timeout for receiving responses
-    timeval tv;
-    tv.tv_sec = 3;
-    tv.tv_usec = 0;
-    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        perror("setsockopt");
-        close(s);
-        return false;
-    }
-
-    // Destination address
-    struct sockaddr_in dst;
-    std::memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &dst.sin_addr) != 1) {
-        std::cerr << "bad ip address for evil: " << ip << "\n";
-        close(s);
-        return false;
-    }
-
-    // Trying 2 byte orders: network order first, fallback to host order.
-    uint32_t orders[2] = { htonl(signature), signature };
-    bool sent_ok = false;
-    bool got_reply = false;
-    char rbuf[1024];
-    sockaddr_in from; socklen_t fl = sizeof(from);
-
-    for (int attempt = 0; attempt < 2 && !got_reply; ++attempt) {
-        uint32_t out = orders[attempt];
-        ssize_t n = sendto(s, &out, sizeof(out), 0, (const sockaddr*)&dst, sizeof(dst));
-        if (n != (ssize_t)sizeof(out)) {
-            perror("sendto evil signature");
-        } else {
-            sent_ok = true;
-            std::cout << "[EVIL] Sent 4-byte signature (order " << (attempt==0 ? "network" : "host") << ")\n";
-            // wait for reply
-            ssize_t r = recvfrom(s, rbuf, sizeof(rbuf)-1, 0, (sockaddr*)&from, &fl);
-            if (r < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    std::cerr << "[EVIL] no reply (timeout) for this byte order, trying next\n";
-                    continue;
-                } else {
-                    perror("recvfrom evil");
-                    break;
-                }
-            } else {
-                // got a reply
-                rbuf[r] = '\0';
-                char frombuf[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &from.sin_addr, frombuf, sizeof(frombuf));
-                std::cout << "[EVIL] reply from " << frombuf << ":" << ntohs(from.sin_port)
-                          << " (" << r << " bytes): '" << rbuf << "'\n";
-                got_reply = true;
-                break;
-            }
-        }
-    }
-
-    if (!sent_ok) {
-        std::cerr << "[EVIL] failed to send signature\n";
-    }
-
-    close(s);
-    return got_reply || sent_ok;
-}
-
 bool handle_exps(const char* ip, int port, uint32_t signature, const std::vector<int>& secret_ports) {
     // send secret ports list + knocks, format: [4 bytes signature][phrase]
     std::cout << "[STUB] handle_exps on port " << port << " (signature=" << signature << ")\n";
     return true;
 }
-
 
 int main(int argc, char *argv[]) {
     int port1 = 0;
@@ -482,7 +474,7 @@ int main(int argc, char *argv[]) {
     std::vector<int> secret_ports;
     static int secret_port1 = 0;
 
-    // 1) SECRET (required for signature)
+    // 1) SECRET
     if (port_of[SECRET] != -1) {
         std::cout << "========================== S.E.C.R.E.T PORT ON " << port_of[SECRET] << " ==========================\n";
         if (!handle_secret(ip_string, port_of[SECRET], groupID, signature, secret_port1)) {
