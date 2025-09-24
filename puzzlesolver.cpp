@@ -17,6 +17,17 @@
 #include <cctype>
 #include <cstdlib>
 
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+
+// ===== macOS-compatible UDP header =====
+struct udphdr_mac {
+    uint16_t uh_sport; // source port
+    uint16_t uh_dport; // dest port
+    uint16_t uh_ulen;  // udp length
+    uint16_t uh_sum;   // udp checksum
+};
+
 // ========== Global variables ==========
 const std::string usernames = "georg23,arnagud21";
 const int SECRET = 0;
@@ -42,14 +53,14 @@ void check_in_range(int val) {
 }
 
 // ========== Port Classification ==========
-int check_port_type(const std::string &s) {
-    if (s.find("Greetings from S.E.C.R.E.T.") != std::string::npos) {
+int check_port_type(const std::string &sock) {
+    if (sock.find("Greetings from S.E.C.R.E.T.") != std::string::npos) {
         return SECRET;
-    } else if (s.find("Send me a 4-byte message containing the signature") != std::string::npos) {
+    } else if (sock.find("Send me a 4-byte message containing the signature") != std::string::npos) {
         return CHECKSUM;
-    } else if (s.find("I am an evil port") != std::string::npos) {
+    } else if (sock.find("I am an evil port") != std::string::npos) {
         return EVIL;
-    } else if (s.find("E.X.P.S.T.N") != std::string::npos) {
+    } else if (sock.find("E.X.P.S.T.N") != std::string::npos) {
         return EXPSTN;
     } else {
         return -1;
@@ -203,7 +214,7 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
 
             try {
                 // 1) targeted regex: look for "port[: -]*<digits>"
-                std::regex port_re(R"(port[:\s-]*([0-9]{1,5}))", std::regex_constants::icase);
+                std::regex port_re(R"(port[:\sock-]*([0-9]{1,5}))", std::regex_constants::icase);
                 if (std::regex_search(reply_str, sm, port_re) && sm.size() >= 2) {
                     parsed_val = std::stol(sm[1].str());
                     parsed_ok = true;
@@ -307,14 +318,14 @@ bool handle_evil(const char* ip, int port, uint32_t signature, uint8_t groupID) 
 
     // for (int attempt = 0; attempt < 2 && !got_reply; ++attempt) {
     //     uint32_t out = orders[attempt];
-    //     ssize_t n = sendto(s, &out, sizeof(out), 0, (const sockaddr*)&dst, sizeof(dst));
+    //     ssize_t n = sendto(sock, &out, sizeof(out), 0, (const sockaddr*)&dst, sizeof(dst));
     //     if (n != (ssize_t)sizeof(out)) {
     //         perror("sendto evil signature");
     //     } else {
     //         sent_ok = true;
     //         std::cout << "[EVIL] Sent 4-byte signature (order " << (attempt==0 ? "network" : "host") << ")\n";
     //         // wait for reply
-    //         ssize_t r = recvfrom(s, rbuf, sizeof(rbuf)-1, 0, (sockaddr*)&from, &fl);
+    //         ssize_t r = recvfrom(sock, rbuf, sizeof(rbuf)-1, 0, (sockaddr*)&from, &fl);
     //         if (r < 0) {
     //             if (errno == EAGAIN || errno == EWOULDBLOCK) {
     //                 std::cerr << "[EVIL] no reply (timeout) for this byte order, trying next\n";
@@ -344,11 +355,240 @@ bool handle_evil(const char* ip, int port, uint32_t signature, uint8_t groupID) 
     close(raw_sock);
     return true;
 }
+// Pseudo-header for UDP checksum calculation
+struct pseudo_header {
+    uint32_t src_addr;
+    uint32_t dest_addr;
+    uint8_t placeholder;
+    uint8_t protocol;
+    uint16_t udp_length;
+};
 
-bool handle_checksum(const char* ip, int port, uint32_t signature) {
-    // send 4-byte signature (network order), parse reply as needed
-    // return true/false
-    std::cout << "[STUB] handle_checksum on port " << port << " with signature=" << signature << "\n";
+// Function to calculate the checksum for the UDP header
+uint16_t calculate_checksum(unsigned short *udpheader, u_short len){
+    long checksum = 0;
+    u_short odd_byte;
+    short checksum_short;
+
+    while(len > 1) {
+        checksum += *udpheader++;
+        len -= 2;
+    }
+    if(len == 1) {
+        odd_byte = 0;
+        *((u_char*) &odd_byte) = *(u_char*)udpheader;
+        checksum += odd_byte;
+    }
+
+    checksum = (checksum >> 16) + (checksum & 0xffff);
+    checksum = checksum + (checksum >> 16);
+    checksum_short = (short)~checksum;
+
+    return checksum_short;
+}
+
+bool handle_checksum(const char* ip, int port, uint32_t signature, uint8_t groupID) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("checksum socket");
+        return false;
+    }
+
+    // Timeout
+    timeval tv;
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt");
+        close(sock);
+        return false;
+    }
+
+    // Destination address
+    struct sockaddr_in dst;
+    std::memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &dst.sin_addr) != 1) {
+        std::cerr << "bad ip address for checksum: " << ip << "\n";
+        close(sock);
+        return false;
+    }
+
+    // Step 1: Send initial probe to get the target checksum
+    uint32_t net_sig = htonl(signature);
+    ssize_t sent = sendto(sock, &net_sig, sizeof(net_sig), 0, (sockaddr*)&dst, sizeof(dst));
+    if (sent != sizeof(net_sig)) {
+        perror("[CHECKSUM] initial sendto");
+        close(sock);
+        return false;
+    }
+    std::cout << "[CHECKSUM] Sent initial signature (" << sent << " bytes)\n";
+
+    // Receive response
+    char buf[2048];
+    sockaddr_in from;
+    socklen_t fl = sizeof(from);
+    ssize_t r = recvfrom(sock, buf, sizeof(buf)-1, 0, (sockaddr*)&from, &fl);
+    if (r < 0) {
+        perror("[CHECKSUM] recvfrom");
+        close(sock);
+        return false;
+    }
+    buf[r] = '\0';
+    std::cout << "[CHECKSUM] Initial reply: " << buf << "\n";
+
+    // Parse target checksum and source IP from reply
+    uint16_t target_checksum = 0;
+    std::string source_ip_str;
+    std::string reply(buf);
+    std::smatch sm;
+
+    // Try parsing checksum from text
+    std::regex checksum_re(R"(checksum\s+of\s+0x([0-9a-fA-F]{1,4}))", std::regex_constants::icase);
+    if (std::regex_search(reply, sm, checksum_re) && sm.size() >= 2) {
+        try {
+            target_checksum = static_cast<uint16_t>(std::stoul(sm[1].str(), nullptr, 16));
+            std::cout << "[CHECKSUM] Parsed checksum from text: 0x" << std::hex << target_checksum << std::dec << "\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[CHECKSUM] Failed to parse checksum from text: " << e.what() << "\n";
+        }
+    }
+
+    // Try parsing source IP from text
+    std::regex ip_re(R"(source address being\s+([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}))");
+    if (std::regex_search(reply, sm, ip_re) && sm.size() >= 2) {
+        source_ip_str = sm[1].str();
+        std::cout << "[CHECKSUM] Parsed source IP from text: " << source_ip_str << "\n";
+    }
+
+    // Fallback: Extract checksum and IP from last 6 bytes if not found in text
+    if ((target_checksum == 0 || source_ip_str.empty()) && r >= 6) {
+        if (target_checksum == 0) {
+            memcpy(&target_checksum, buf + r - 6, 2);
+            target_checksum = ntohs(target_checksum);
+            std::cout << "[CHECKSUM] Extracted checksum from bytes: 0x" << std::hex << target_checksum << std::dec << "\n";
+        }
+        if (source_ip_str.empty()) {
+            uint32_t ip_addr;
+            memcpy(&ip_addr, buf + r - 4, 4);
+            char ip_buf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &ip_addr, ip_buf, INET_ADDRSTRLEN);
+            source_ip_str = ip_buf;
+            std::cout << "[CHECKSUM] Extracted source IP from bytes: " << source_ip_str << "\n";
+        }
+    }
+
+    if (target_checksum == 0 || source_ip_str.empty()) {
+        std::cerr << "[CHECKSUM] Failed to extract required information\n";
+        close(sock);
+        return false;
+    }
+
+    // Build encapsulated IPv4 packet (IP header + UDP header + 2-byte data)
+    const int data_len = 2; // 2-byte data field for adjustment
+    const int udp_header_len = sizeof(struct udphdr);
+    const int ip_header_len = sizeof(struct ip);
+    const int total_len = ip_header_len + udp_header_len + data_len;
+
+    char udp_packet[4096];
+    memset(udp_packet, 0, sizeof(udp_packet));
+    
+    struct ip* iph = (struct ip*)udp_packet;
+    struct udphdr* udph = (struct udphdr*)(udp_packet + ip_header_len);
+    char* message_buffer = udp_packet + ip_header_len + udp_header_len;
+
+    // Set IP header (matching working code structure)
+    struct in_addr src_addr;
+    inet_aton(source_ip_str.c_str(), &src_addr);
+    iph->ip_src = src_addr;
+    iph->ip_dst = dst.sin_addr;  // Use the destination from our socket
+    iph->ip_ttl = 255;
+    iph->ip_len = htons(total_len);
+    iph->ip_hl = 5;
+    iph->ip_p = IPPROTO_UDP;
+    iph->ip_tos = 0;
+    iph->ip_off = 0;
+    iph->ip_id = htons(1377);
+    iph->ip_v = 4;
+
+    // Calculate and set IP header checksum
+    iph->ip_sum = 0;
+    iph->ip_sum = calculate_checksum((unsigned short*)iph, ip_header_len);
+
+    // Set UDP header
+    udph->uh_sport = htons(58585);
+    udph->uh_dport = htons(port);
+    udph->uh_ulen = htons(udp_header_len + data_len);
+    udph->uh_sum = htons(target_checksum);  // Set to target checksum
+
+    // Create pseudo header for checksum calculation
+    struct pseudo_header {
+        uint32_t src_addr;
+        uint32_t dest_addr;
+        uint8_t placeholder;
+        uint8_t protocol;
+        uint16_t udp_length;
+    } psh;
+
+    psh.src_addr = src_addr.s_addr;
+    psh.dest_addr = dst.sin_addr.s_addr;
+    psh.placeholder = 0;
+    psh.protocol = IPPROTO_UDP;
+    psh.udp_length = htons(udp_header_len + data_len);
+
+    // Calculate what data value will make the checksum valid
+    int psize = sizeof(struct pseudo_header) + udp_header_len + data_len;
+    char* pseudo_data = (char*)malloc(psize);
+    memcpy(pseudo_data, &psh, sizeof(struct pseudo_header));
+    memcpy(pseudo_data + sizeof(struct pseudo_header), udph, udp_header_len);
+    memcpy(pseudo_data + sizeof(struct pseudo_header) + udp_header_len, message_buffer, data_len);
+
+    // Calculate the adjustment value needed
+    unsigned short adjustment = calculate_checksum((unsigned short*)pseudo_data, psize);
+    memcpy(message_buffer, &adjustment, 2);
+
+    free(pseudo_data);
+
+    std::cout << "[CHECKSUM] Target checksum: 0x" << std::hex << target_checksum << std::dec << "\n";
+    std::cout << "[CHECKSUM] Adjustment value: 0x" << std::hex << adjustment << std::dec << "\n";
+
+    // Debug: Print packet contents
+    std::cout << "[CHECKSUM] UDP packet (first 40 bytes): ";
+    for (size_t i = 0; i < std::min((size_t)40, (size_t)total_len); ++i) {
+        printf("%02x ", (unsigned char)udp_packet[i]);
+    }
+    printf("\n");
+
+    // Send the encapsulated packet
+    sent = sendto(sock, udp_packet, total_len, 0, (sockaddr*)&dst, sizeof(dst));
+    if (sent != total_len) {
+        if (sent < 0) perror("[CHECKSUM] sendto");
+        else std::cerr << "[CHECKSUM] short send " << sent << " bytes\n";
+        close(sock);
+        return false;
+    }
+    std::cout << "[CHECKSUM] Sent " << sent << " bytes\n";
+
+    // Receive response
+    r = recvfrom(sock, buf, sizeof(buf)-1, 0, (sockaddr*)&from, &fl);
+    if (r < 0) {
+        perror("[CHECKSUM] recvfrom");
+        close(sock);
+        return false;
+    }
+    buf[r] = '\0';
+    std::cout << "[CHECKSUM] Final reply: " << buf << "\n";
+
+    // // Extract secret phrase (matching working code)
+    // if (r >= 22) {
+    //     char port_string[24];
+    //     memcpy(port_string, buf + r - 22, 21);
+    //     port_string[21] = '\0';
+    //     std::cout << "[CHECKSUM] Secret phrase: " << port_string << "\n";
+    // }
+
+    close(sock);
     return true;
 }
 
@@ -504,7 +744,7 @@ int main(int argc, char *argv[]) {
     // 3) CHECKSUM
     if (port_of[CHECKSUM] != -1) {
         std::cout << "========================== C.H.E.C.K.S.U.M PORT ON " << port_of[CHECKSUM] << " ==========================\n";
-        if (!handle_checksum(ip_string, port_of[CHECKSUM], signature)) {
+        if (!handle_checksum(ip_string, port_of[CHECKSUM], signature, static_cast<uint8_t>(groupID))) {
             std::cerr << "CHECKSUM failed\n";
         }
     } else {
