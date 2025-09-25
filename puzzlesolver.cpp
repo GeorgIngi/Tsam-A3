@@ -20,14 +20,6 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 
-// ===== macOS-compatible UDP header =====
-struct udphdr_mac {
-    uint16_t uh_sport; // source port
-    uint16_t uh_dport; // dest port
-    uint16_t uh_ulen;  // udp length
-    uint16_t uh_sum;   // udp checksum
-};
-
 // ========== Global variables ==========
 const std::string usernames = "georg23,arnagud21";
 const int SECRET = 0;
@@ -126,50 +118,35 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
         return false;
     }
     std::cout << "Sent S message (" << sent << " bytes). Usernames: \"" << usernames << "\"\n";
-    std::cout << "[DEBUG] S message bytes:";
-    for (size_t i=0;i<msg.size();++i) printf(" %02x", (unsigned char)msg[i]);
-    printf("\n");
-    
 
-    // 3) wait for 5-byte challenge (up to a few attempts)
+    // 3) wait for 5-byte challenge 
     char buf[1024];
     sockaddr_in from;
-    ssize_t n = -1;
-    bool got_challenge = false;
-    for (int attempt=0; attempt<3 && !got_challenge; ++attempt) {
-        socklen_t fl = sizeof(from);
-        n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                std::cerr << "[DEBUG] attempt " << attempt+1 << " to receive 5-byte challenge timed out\n";
-            } else {
-                perror("recvfrom challenge");
-                close(sock);
-                return false;
-            }
-        }
-        if (n == 5) {
-            got_challenge = true;
-            break;
+    socklen_t fl = sizeof(from);
+    ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            std::cerr << "[DEBUG] timeout waiting to receive 5-byte challenge\n";
         } else {
-            std::cerr << "[DEBUG] expected 5 bytes for challenge, got " << n << " bytes\n";
+            perror("recvfrom challenge");
         }
+        close(sock);
+        return false;
     }
-
-    if (!got_challenge) {
-        std::cerr << "SECRET failed: did not receive 5-byte challenge from S.E.C.R.E.T.\n";
+    if (n != 5) {
+        std::cerr << "[DEBUG] expected 5 bytes for challenge, got " << n << " bytes\n";
         close(sock);
         return false;
     }
 
     uint8_t groupID = static_cast<uint8_t>(buf[0]);
-    uint32_t challenge32;
-    std::memcpy(&challenge32, buf+1, 4);
-    challenge32 = ntohl(challenge32);
-    std::cout << "[INFO] Received groupID=" << (int)groupID << " challenge=" << challenge32 << "\n";
+    uint32_t challenge;
+    std::memcpy(&challenge, buf+1, 4);
+    challenge = ntohl(challenge);
+    std::cout << "[INFO] Received groupID=" << (int)groupID << " challenge=" << challenge << "\n";
 
     // 4) compute signature
-    uint32_t signature = challenge32 ^ secret_number;
+    uint32_t signature = challenge ^ secret_number;
     uint32_t net_sig = htonl(signature);
 
     // 5) reply with groupID + signature
@@ -182,69 +159,60 @@ bool handle_secret(const char* ip, int port, uint32_t &out_groupID, uint32_t &ou
         close(sock);
         return false;
     }
-    std::cout << "[INFO] Sent signature reply (5 bytes). signature=" << signature << "\n";
-    std::cout << "[DEBUG] signature bytes:";
-    for (int i=0;i<5;++i) printf(" %02x", (unsigned char)reply[i]);
-    printf("\n");
-
+    
     // 6) wait for final secret port reply
-    bool got_secret_port = false;
-    ssize_t m = -1;
-    for (int attempt=0; attempt<4 && !got_secret_port; ++attempt) {
-        socklen_t fl = sizeof(from);
-        m = recvfrom(sock, buf, sizeof(buf)-1, 0, (sockaddr*)&from, &fl);
-        if (m < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                std::cerr << "[DEBUG] attempt " << attempt+1 << " waiting for secret-port reply timed out\n";
-            } else {
-                perror("recv from secret port");
-            }
-            continue;
+    socklen_t fl2 = sizeof(from);
+    ssize_t m = recvfrom(sock, buf, sizeof(buf)-1, 0, (sockaddr*)&from, &fl2);
+    if (m < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            std::cerr << "[DEBUG] timeout waiting for secret-port reply\n";
+        } else {
+            perror("recv from secret port");
         }
-        if (m > 0) {
-            buf[m] = '\0';
-            std::string reply_str(buf, m);
-            std::smatch sm;
-            bool parsed_ok = false;
-            long parsed_val = 0;
-
-            try {
-                // 1) targeted regex: look for "port[: -]*<digits>"
-                std::regex port_re(R"(port[:\sock-]*([0-9]{1,5}))", std::regex_constants::icase);
-                if (std::regex_search(reply_str, sm, port_re) && sm.size() >= 2) {
-                    parsed_val = std::stol(sm[1].str());
-                    parsed_ok = true;
-                } else {
-                    // 2) fallback: find all digit runs and take the last one
-                    std::regex all_digits(R"((\d{1,5}))");
-                    std::sregex_iterator it(reply_str.begin(), reply_str.end(), all_digits);
-                    std::sregex_iterator end;
-                    for (; it != end; ++it) {
-                        parsed_val = std::stol((*it)[1].str()); // last match wins
-                        parsed_ok = true;
-                    }
-                }
-            } catch (const std::exception &e) {
-                std::cerr << "[WARN] exception parsing port from reply: " << e.what() << "\n";
-                parsed_ok = false;
-            }
-
-            if (parsed_ok) {
-                if (parsed_val >= 1 && parsed_val <= 65535) {
-                    secret_port1 = static_cast<int>(parsed_val);
-                    got_secret_port = true;
-                    break;
-                } else {
-                    std::cerr << "[WARN] parsed port out of range: " << parsed_val << "\n";
-                }
-            } else {
-                std::cerr << "[WARN] no numeric substring found in reply\n";
-            }
-        }
+        close(sock);
+        return false;
     }
-
-    if (!got_secret_port) {
-        std::cerr << "SECRET recv timeout waiting for secret port (or couldn't parse it)\n";
+    if (m > 0) {
+        buf[m] = '\0';
+        std::string reply_str(buf, m);
+        std::smatch sm;
+        bool parsed_ok = false;
+        long parsed_val = 0;
+        try {
+            // 1) targeted regex: look for "port[: -]*<digits>"
+            std::regex port_re(R"(port[:\sock-]*([0-9]{1,5}))", std::regex_constants::icase);
+            if (std::regex_search(reply_str, sm, port_re) && sm.size() >= 2) {
+                parsed_val = std::stol(sm[1].str());
+                parsed_ok = true;
+            } else {
+                // 2) fallback: find all digit runs and take the last one
+                std::regex all_digits(R"((\d{1,5}))");
+                std::sregex_iterator it(reply_str.begin(), reply_str.end(), all_digits);
+                std::sregex_iterator end;
+                for (; it != end; ++it) {
+                    parsed_val = std::stol((*it)[1].str()); // last match wins
+                    parsed_ok = true;
+                }
+            }
+        } catch (const std::exception &e) {
+            std::cerr << "[WARN] exception parsing port from reply: " << e.what() << "\n";
+            parsed_ok = false;
+        }
+        if (parsed_ok) {
+            if (parsed_val >= 1 && parsed_val <= 65535) {
+                secret_port1 = static_cast<int>(parsed_val);
+            } else {
+                std::cerr << "[WARN] parsed port out of range: " << parsed_val << "\n";
+                close(sock);
+                return false;
+            }
+        } else {
+            std::cerr << "[WARN] no numeric substring found in reply\n";
+            close(sock);
+            return false;
+        }
+    } else {
+        std::cerr << "[WARN] did not receive any bytes for secret port reply\n";
         close(sock);
         return false;
     }
@@ -316,7 +284,6 @@ bool handle_evil(const char* ip, int port, uint32_t signature, uint8_t groupID, 
 
     // Get local IP address
     std::string local_ip = getLocalIPAddress(ip);
-    std::cout << "[EVIL] Using local IP: " << local_ip << std::endl;
 
     // Bind the receiving socket to port 58585
     struct sockaddr_in recv_addr;
@@ -378,9 +345,6 @@ bool handle_evil(const char* ip, int port, uint32_t signature, uint8_t groupID, 
 
     // Total packet length
     int length = sizeof(struct ip) + sizeof(struct udphdr) + sizeof(evil_signature);
-
-    std::cout << "[EVIL] Sending packet with signature: 0x" << std::hex << signature << std::dec << std::endl;
-    std::cout << "[EVIL] Evil bit set in IP header (offset = 0x8000)" << std::endl;
 
     // Send the raw packet
     if (sendto(raw_sock, udp_packet, length, 0, (struct sockaddr *)&server_address, sizeof(server_address)) < 0) {
@@ -522,7 +486,7 @@ bool handle_checksum(const char* ip, int port, uint32_t signature, uint8_t group
     std::string reply(buf);
     std::smatch sm;
 
-    // Try parsing checksum from text
+    // Parsing checksum from text
     std::regex checksum_re(R"(checksum\s+of\s+0x([0-9a-fA-F]{1,4}))", std::regex_constants::icase);
     if (std::regex_search(reply, sm, checksum_re) && sm.size() >= 2) {
         try {
@@ -533,28 +497,11 @@ bool handle_checksum(const char* ip, int port, uint32_t signature, uint8_t group
         }
     }
 
-    // Try parsing source IP from text
+    // Parsing source IP from text
     std::regex ip_re(R"(source address being\s+([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}))");
     if (std::regex_search(reply, sm, ip_re) && sm.size() >= 2) {
         source_ip_str = sm[1].str();
         std::cout << "[CHECKSUM] Parsed source IP from text: " << source_ip_str << "\n";
-    }
-
-    // Fallback: Extract checksum and IP from last 6 bytes if not found in text
-    if ((target_checksum == 0 || source_ip_str.empty()) && r >= 6) {
-        if (target_checksum == 0) {
-            memcpy(&target_checksum, buf + r - 6, 2);
-            target_checksum = ntohs(target_checksum);
-            std::cout << "[CHECKSUM] Extracted checksum from bytes: 0x" << std::hex << target_checksum << std::dec << "\n";
-        }
-        if (source_ip_str.empty()) {
-            uint32_t ip_addr;
-            memcpy(&ip_addr, buf + r - 4, 4);
-            char ip_buf[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &ip_addr, ip_buf, INET_ADDRSTRLEN);
-            source_ip_str = ip_buf;
-            std::cout << "[CHECKSUM] Extracted source IP from bytes: " << source_ip_str << "\n";
-        }
     }
 
     if (target_checksum == 0 || source_ip_str.empty()) {
@@ -601,13 +548,7 @@ bool handle_checksum(const char* ip, int port, uint32_t signature, uint8_t group
     udph->uh_sum = htons(target_checksum);  // Set to target checksum
 
     // Create pseudo header for checksum calculation
-    struct pseudo_header {
-        uint32_t src_addr;
-        uint32_t dest_addr;
-        uint8_t placeholder;
-        uint8_t protocol;
-        uint16_t udp_length;
-    } psh;
+    pseudo_header psh;
 
     psh.src_addr = src_addr.s_addr;
     psh.dest_addr = dst.sin_addr.s_addr;
@@ -829,41 +770,22 @@ bool handle_exps(const char* ip, int port, uint32_t signature, std::string secre
 }
 
 int main(int argc, char *argv[]) {
-    int port1 = 0;
-    int port2 = 0;
-    int port3 = 0;
-    int port4 = 0;
-
     if (argc != 6) {
         std::cerr << "Command needs to be ./puzzlesolver [IP] [PORT 1] [PORT 2] [PORT 3] [PORT 4]\n";
         return 1;
     }
-
+    
     const char* ip_string = argv[1];
-    std::string port1_str = argv[2];
-    std::string port2_str = argv[3];
-    std::string port3_str = argv[4];
-    std::string port4_str = argv[5];
-
-    check_if_digit(port1_str);
-    check_if_digit(port2_str);
-    check_if_digit(port3_str);
-    check_if_digit(port4_str);
-
-    int port1_parsed = std::stoi(port1_str);
-    int port2_parsed = std::stoi(port2_str);
-    int port3_parsed = std::stoi(port3_str);
-    int port4_parsed = std::stoi(port4_str);
-
-    check_in_range(port1_parsed);
-    check_in_range(port2_parsed);
-    check_in_range(port3_parsed);
-    check_in_range(port4_parsed);
-
-    port1 = port1_parsed;
-    port2 = port2_parsed;
-    port3 = port3_parsed;
-    port4 = port4_parsed;
+    
+    // Loop to validate ports
+    std::vector<int> input_ports;
+    for (int i = 2; i <= 5; ++i) {
+        std::string port_str = argv[i];
+        check_if_digit(port_str);
+        int port = std::stoi(port_str);
+        check_in_range(port);
+        input_ports.push_back(port);
+    }
 
     // Create socket
     int sock;
@@ -882,12 +804,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    std::vector<int> input_ports = {port1, port2, port3, port4};
-
     // Map: type -> actual port. Initialize to -1 (unknown)
     int port_of[4] = {-1, -1, -1, -1};
 
-    // ---- SCAN & CLASSIFY ONLY (no handlers here) ----
+    // ---- SCAN & CLASSIFY ----
     for (int port : input_ports) {
         sockaddr_in dst{}; 
         dst.sin_family = AF_INET; 
@@ -939,11 +859,11 @@ int main(int argc, char *argv[]) {
     close(sock);
 
     // ---- RUN HANDLERS ONCE, IN ORDER ----
-    static uint32_t groupID = 0;
-    static uint32_t signature = 0;
+    uint32_t groupID = 0;
+    uint32_t signature = 0;
     std::vector<int> secret_ports;
-    static int secret_port1 = 0;
-    static int secret_port2 = 0;
+    int secret_port1 = 0;
+    int secret_port2 = 0;
     std::string secret_phrase;
 
     // 1) SECRET

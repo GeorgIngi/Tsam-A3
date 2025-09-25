@@ -46,11 +46,8 @@ int main(int argc, char *argv[]) {
         exit(0);
     }
     
-    // IP ADDRESS is argument nr 1
+    // Assign arguments to variables
     const char* ip_string = argv[1];
-
-    // LOW PORT is argument nr 2
-    // HIGH PORT is argument nr 3
     std::string low_port_str = argv[2];
     std::string high_port_str = argv[3];
 
@@ -70,6 +67,7 @@ int main(int argc, char *argv[]) {
     high_port = high_parsed;
     low_port = low_parsed;
 
+    // Create socket
     int sock;
     if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket creation failed");
@@ -85,7 +83,7 @@ int main(int argc, char *argv[]) {
     // Set timeout for receiving responses to 1 second
     struct timeval tv;
     tv.tv_sec = 1;
-    tv.tv_usec = 0; // 1 second
+    tv.tv_usec = 0; 
     if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
         perror("setsockopt failed");
         close(sock);

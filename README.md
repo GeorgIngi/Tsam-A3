@@ -16,7 +16,7 @@ make
 ./scanner 130.208.246.98 4000 4100
 ```
 
-* Run puzzle solver (may require root for raw sockets):
+* Then, run puzzle solver (may require root for raw sockets):
 
 ```bash
 sudo ./puzzlesolver <IP> <port1> <port2> <port3> <port4>
@@ -28,6 +28,7 @@ sudo ./puzzlesolver 130.208.246.98 4008 4022 4034 4080
 
 * `puzzlesolver` uses raw sockets (E.V.I.L.) and may need `sudo`.
 * The program expects the four puzzle ports as arguments in any order; it auto-detects each role from the banners.
+* You might need to run `puzzlesolver` again if it doesn't work the first time.
 
 ## Files
 
