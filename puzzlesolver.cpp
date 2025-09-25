@@ -16,7 +16,7 @@
 #include <random>
 #include <cctype>
 #include <cstdlib>
-
+#include <set>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 
@@ -658,35 +658,31 @@ bool handle_checksum(const char* ip, int port, uint32_t signature, uint8_t group
     buf[r] = '\0';
     std::cout << "[CHECKSUM] Final reply: " << buf << "\n";
 
-    // Find the newline character
+    // Parse secret phrase from reply
     char* phrase = strchr(buf, '\n');
     if (phrase) {
         phrase++; // Move past the newline
-        // Check for opening quote
         if (phrase[0] == '"') {
             phrase++; // Move past the opening quote
-            // Find the closing quote
             char* end_quote = strchr(phrase, '"');
             if (end_quote) {
-                *end_quote = '\0'; // Temporarily terminate the string at the closing quote
-                std::cout << "[CHECKSUM] Final reply: " << phrase << "\n";
-                *end_quote = '"'; // Restore the original buffer (optional, if needed)
+                *end_quote = '\0'; // Temporarily terminate at the closing quote
+                out_secret_phrase = phrase;
             } else {
-                std::cout << "[CHECKSUM] No closing quote found: " << phrase << "\n";
+                out_secret_phrase = phrase;
             }
         } else {
-            std::cout << "[CHECKSUM] No opening quote found: " << phrase << "\n";
+            out_secret_phrase = phrase;
         }
     } else {
-        std::cout << "[CHECKSUM] No newline found, printing entire buffer: " << buf << "\n";
-    }
-    out_secret_phrase = phrase;
+        out_secret_phrase = buf;
+    }   
 
     close(sock);
     return true;
 }
 
-bool handle_exps(const char* ip, int port, uint32_t signature, const std::vector<int>& secret_ports, std::string &out_secret_phrase) {
+bool handle_exps(const char* ip, int port, uint32_t signature, std::string secret_phrase, const std::vector<int>& secret_ports) {
     if (secret_ports.empty()) {
         std::cerr << "[EXPS] No secret ports provided\n";
         return false;
@@ -752,18 +748,84 @@ bool handle_exps(const char* ip, int port, uint32_t signature, const std::vector
         close(sock);
         return false;
     }
-    buf[n] = '\0';
+    buf[r] = '\0';
     std::string reply(buf, r);
-    std::cout << "[EXPS] Received reply (" << n << " bytes):\n" << reply << "\n";
+    std::cout << "[EXPS] Received reply (" << r << " bytes):\n" << reply << "\n";
 
-    // Parse the secret phrase
-    std::string phrase;
-    {
-        std::smatch sm;
-        std::regex re_single("'([^']+)'");
-        std::regex re_double("\"([^\"]+)\"");
-        
+
+    // Parse knock order: pull all numbers from reply, in order, including repeats
+    std::vector<int> knock_order;
+    size_t pos = 0;
+    while (pos < reply.size()) {
+        // Skip non-digit characters
+        while (pos < reply.size() && !isdigit(reply[pos])) ++pos;
+        if (pos >= reply.size()) break;
+        // Parse number
+        int val = 0;
+        while (pos < reply.size() && isdigit(reply[pos])) {
+            val = val * 10 + (reply[pos] - '0');
+            ++pos;
+        }
+        knock_order.push_back(val);
     }
+
+    // Knock each port in sequence
+    if (knock_order.empty()) {
+        std::cerr << "[EXPS] No knocking sequence found in reply\n";
+        close(sock);
+        return false;
+    }
+
+    for (int knock_port : knock_order) {
+        std::cout << "[EXPS] Knocking on port " << knock_port << "\n";
+
+        // Build the payload: 4 bytes signature (network order) + secret phrase
+        uint32_t net_sig = htonl(signature);
+        std::string payload;
+        payload.resize(4);
+        memcpy(&payload[0], &net_sig, 4);
+        payload += secret_phrase;
+
+        // Setup the server address
+        struct sockaddr_in knock_addr;
+        knock_addr.sin_family = AF_INET;
+        knock_addr.sin_port = htons(knock_port);
+        if (inet_pton(AF_INET, ip, &knock_addr.sin_addr) != 1) {
+            std::cerr << "bad ip address for knocking: " << ip << "\n";
+            continue;
+        }
+
+        // Send the knock (only send the actual payload size)
+        ssize_t sent = sendto(sock, payload.data(), payload.size(), 0,
+                              (sockaddr*)&knock_addr, sizeof(knock_addr));
+        if (sent < 0) {
+            perror("[EXPS] sendto knock");
+        } else {
+            std::cout << "[EXPS] Sent " << sent << " bytes to port " << knock_port << "\n";
+        }
+
+        // Wait a short time before the next knock
+        usleep(120000); // 120 ms
+
+        // Receive the message back from the server
+        char buf[4096];
+        sockaddr_in from{};
+        socklen_t fl = sizeof(from);
+        ssize_t r = recvfrom(sock, buf, sizeof(buf)-1, 0, (sockaddr*)&from, &fl);
+        if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                std::cerr << "[EXPS] timeout waiting for instructions\n";
+            else
+                perror("[EXPS] recvfrom");
+            close(sock);
+            return false;
+        } else {
+            buf[r] = '\0';
+            std::string reply(buf, r);
+            std::cout << "[EXPS] Received reply (" << r << " bytes):\n" << reply << "\n";
+        }
+    }
+    return true;
 }
 
 int main(int argc, char *argv[]) {
@@ -882,6 +944,7 @@ int main(int argc, char *argv[]) {
     std::vector<int> secret_ports;
     static int secret_port1 = 0;
     static int secret_port2 = 0;
+    std::string secret_phrase;
 
     // 1) SECRET
     if (port_of[SECRET] != -1) {
@@ -914,7 +977,6 @@ int main(int argc, char *argv[]) {
     // 3) CHECKSUM
     if (port_of[CHECKSUM] != -1) {
         std::cout << "========================== C.H.E.C.K.S.U.M PORT ON " << port_of[CHECKSUM] << " ==========================\n";
-        std::string secret_phrase;
         if (!handle_checksum(ip_string, port_of[CHECKSUM], signature, static_cast<uint8_t>(groupID), secret_phrase)) {
             std::cerr << "CHECKSUM failed\n";
         }
@@ -924,10 +986,8 @@ int main(int argc, char *argv[]) {
 
     // 4) EXPSTN
     if (port_of[EXPSTN] != -1) {
-        std::cout << "========================== E.X.P.S.T.N PORT ON " << port_of[EXPSTN] << " ==========================\n";
-        // add more secret ports if needed
-        std::string secret_phrase;  
-        if (!handle_exps(ip_string, port_of[EXPSTN], signature, secret_ports, secret_phrase)) {
+        std::cout << "========================== E.X.P.S.T.N PORT ON " << port_of[EXPSTN] << " ==========================\n";  
+        if (!handle_exps(ip_string, port_of[EXPSTN], signature, secret_phrase, secret_ports)) {
             std::cerr << "E.X.P.S.T.N. failed\n";
         } 
     } else {
